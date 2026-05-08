@@ -55,6 +55,12 @@ const argv = yargs(hideBin(process.argv))
     describe: "Azure tenant ID (optional, applied when using 'interactive' and 'azcli' type of authentication)",
     type: "string",
   })
+  .option("safe-mode", {
+    alias: "s",
+    describe: "Enable safe mode: disables destructive operations (unlink work items, remove PR reviewers, PR auto-complete, bulk field removal, label replacement)",
+    type: "boolean",
+    default: false,
+  })
   .help()
   .parseSync();
 
@@ -80,6 +86,8 @@ function getAzureDevOpsClient(getAzureDevOpsToken: () => Promise<string>, userAg
 }
 
 async function main() {
+  const safeMode = argv["safe-mode"] as boolean;
+
   logger.info("Starting Azure DevOps MCP Server", {
     organization: orgName,
     organizationUrl: orgUrl,
@@ -89,6 +97,7 @@ async function main() {
     enabledDomains: Array.from(enabledDomains),
     version: packageVersion,
     isCodespace: isGitHubCodespaceEnv(),
+    safeMode,
   });
 
   const server = new McpServer({
@@ -128,7 +137,7 @@ async function main() {
   // removing prompts untill further notice
   // configurePrompts(server);
 
-  configureAllTools(server, authenticator, getAzureDevOpsClient(authenticator, userAgentComposer, argv.authentication), () => userAgentComposer.userAgent, enabledDomains);
+  configureAllTools(server, authenticator, getAzureDevOpsClient(authenticator, userAgentComposer, argv.authentication), () => userAgentComposer.userAgent, enabledDomains, safeMode);
 
   const transport = new StdioServerTransport();
   await server.connect(transport);

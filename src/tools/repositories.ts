@@ -161,7 +161,7 @@ function buildVersionDescriptor(version?: string, versionType?: string): GitVers
   };
 }
 
-function configureRepoTools(server: McpServer, tokenProvider: () => Promise<string>, connectionProvider: () => Promise<WebApi>, userAgentProvider: () => string) {
+function configureRepoTools(server: McpServer, tokenProvider: () => Promise<string>, connectionProvider: () => Promise<WebApi>, userAgentProvider: () => string, safeMode = false) {
   server.tool(
     REPO_TOOLS.create_pull_request,
     "Create a new pull request.",
@@ -351,7 +351,7 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<stri
 
   server.tool(
     REPO_TOOLS.update_pull_request,
-    "Update a Pull Request by ID with specified fields, including setting autocomplete with various completion options.",
+    safeMode ? "Update a Pull Request by ID with specified fields." : "Update a Pull Request by ID with specified fields, including setting autocomplete with various completion options.",
     {
       repositoryId: z.string().describe("The ID or name of the repository where the pull request exists. When using a repository name instead of a GUID, the project parameter must also be provided."),
       pullRequestId: z.coerce.number().min(1).describe("The ID of the pull request to update."),
@@ -361,16 +361,25 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<stri
       isDraft: z.boolean().optional().describe("Whether the pull request should be a draft."),
       targetRefName: z.string().optional().describe("The new target branch name (e.g., 'refs/heads/main')."),
       status: z.enum(["Active", "Abandoned"]).optional().describe("The new status of the pull request. Can be 'Active' or 'Abandoned'."),
-      autoComplete: z.boolean().optional().describe("Set the pull request to autocomplete when all requirements are met."),
-      mergeStrategy: z
-        .enum(getEnumKeys(GitPullRequestMergeStrategy) as [string, ...string[]])
+      ...(!safeMode && {
+        autoComplete: z.boolean().optional().describe("Set the pull request to autocomplete when all requirements are met."),
+        mergeStrategy: z
+          .enum(getEnumKeys(GitPullRequestMergeStrategy) as [string, ...string[]])
+          .optional()
+          .describe("The merge strategy to use when the pull request autocompletes. Defaults to 'NoFastForward'."),
+        mergeCommitMessage: z.string().optional().describe("Commit message to use when the pull request is completed."),
+        deleteSourceBranch: z.boolean().optional().default(false).describe("Whether to delete the source branch when the pull request autocompletes. Defaults to false."),
+        transitionWorkItems: z.boolean().optional().default(true).describe("Whether to transition associated work items to the next state when the pull request autocompletes. Defaults to true."),
+        bypassReason: z.string().optional().describe("Reason for bypassing branch policies. When provided, branch policies will be automatically bypassed during autocompletion."),
+      }),
+      labels: z
+        .array(z.string())
         .optional()
-        .describe("The merge strategy to use when the pull request autocompletes. Defaults to 'NoFastForward'."),
-      mergeCommitMessage: z.string().optional().describe("Commit message to use when the pull request is completed."),
-      deleteSourceBranch: z.boolean().optional().default(false).describe("Whether to delete the source branch when the pull request autocompletes. Defaults to false."),
-      transitionWorkItems: z.boolean().optional().default(true).describe("Whether to transition associated work items to the next state when the pull request autocompletes. Defaults to true."),
-      bypassReason: z.string().optional().describe("Reason for bypassing branch policies. When provided, branch policies will be automatically bypassed during autocompletion."),
-      labels: z.array(z.string()).optional().describe("Array of label names to replace existing labels on the pull request. This will remove all current labels and add the specified ones."),
+        .describe(
+          safeMode
+            ? "Label names to add to the pull request. Existing labels are preserved."
+            : "Array of label names to replace existing labels on the pull request. This will remove all current labels and add the specified ones."
+        ),
     },
     async ({
       repositoryId,
@@ -388,6 +397,22 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<stri
       transitionWorkItems,
       bypassReason,
       labels,
+    }: {
+      repositoryId: string;
+      pullRequestId: number;
+      project?: string;
+      title?: string;
+      description?: string;
+      isDraft?: boolean;
+      targetRefName?: string;
+      status?: "Active" | "Abandoned";
+      autoComplete?: boolean;
+      mergeStrategy?: string;
+      mergeCommitMessage?: string;
+      deleteSourceBranch?: boolean;
+      transitionWorkItems?: boolean;
+      bypassReason?: string;
+      labels?: string[];
     }) => {
       try {
         const connection = await connectionProvider();
@@ -404,7 +429,7 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<stri
           updateRequest.status = status === "Active" ? PullRequestStatus.Active.valueOf() : PullRequestStatus.Abandoned.valueOf();
         }
 
-        if (autoComplete !== undefined) {
+        if (!safeMode && autoComplete !== undefined) {
           if (autoComplete) {
             const data = await getCurrentUserDetails(tokenProvider, connectionProvider, userAgentProvider);
             const autoCompleteUserId = data.authenticatedUser.id;
@@ -412,8 +437,8 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<stri
 
             const completionOptions: GitPullRequestCompletionOptions = {
               deleteSourceBranch: deleteSourceBranch || false,
-              transitionWorkItems: transitionWorkItems !== false, // Default to true unless explicitly set to false
-              bypassPolicy: !!bypassReason, // Automatically set to true if bypassReason is provided
+              transitionWorkItems: transitionWorkItems !== false,
+              bypassPolicy: !!bypassReason,
             };
 
             if (mergeStrategy) {
@@ -438,21 +463,33 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<stri
         // Validate that at least one field is provided for update
         if (Object.keys(updateRequest).length === 0 && !labels) {
           return {
-            content: [{ type: "text", text: "Error: At least one field (title, description, isDraft, targetRefName, status, autoComplete options, or labels) must be provided for update." }],
+            content: [{ type: "text", text: "Error: At least one field must be provided for update." }],
             isError: true,
           };
         }
 
-        // Update labels if provided
+        // Update labels
         if (labels) {
-          const currentLabels = await gitApi.getPullRequestLabels(repositoryId, pullRequestId, project);
-          for (const currentLabel of currentLabels) {
-            if (currentLabel.id) {
-              await gitApi.deletePullRequestLabels(repositoryId, pullRequestId, currentLabel.id, project);
+          if (safeMode) {
+            // Additive only — never delete existing labels
+            const currentLabels = await gitApi.getPullRequestLabels(repositoryId, pullRequestId, project);
+            const existingNames = new Set(currentLabels.map((l) => l.name?.toLowerCase()));
+            for (const label of labels) {
+              if (!existingNames.has(label.toLowerCase())) {
+                await gitApi.createPullRequestLabel({ name: label }, repositoryId, pullRequestId, project);
+              }
             }
-          }
-          for (const label of labels) {
-            await gitApi.createPullRequestLabel({ name: label }, repositoryId, pullRequestId, project);
+          } else {
+            // Replace: delete all current labels then add the new set
+            const currentLabels = await gitApi.getPullRequestLabels(repositoryId, pullRequestId, project);
+            for (const currentLabel of currentLabels) {
+              if (currentLabel.id) {
+                await gitApi.deletePullRequestLabels(repositoryId, pullRequestId, currentLabel.id, project);
+              }
+            }
+            for (const label of labels) {
+              await gitApi.createPullRequestLabel({ name: label }, repositoryId, pullRequestId, project);
+            }
           }
         }
 
@@ -488,41 +525,20 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<stri
 
   server.tool(
     REPO_TOOLS.update_pull_request_reviewers,
-    "Add or remove reviewers for an existing pull request.",
+    safeMode ? "Add reviewers to an existing pull request." : "Add or remove reviewers for an existing pull request.",
     {
       repositoryId: z.string().describe("The ID or name of the repository where the pull request exists. When using a repository name instead of a GUID, the project parameter must also be provided."),
       pullRequestId: z.coerce.number().min(1).describe("The ID of the pull request to update."),
-      reviewerIds: z.array(z.string()).describe("List of reviewer ids to add or remove from the pull request."),
-      action: z.enum(["add", "remove"]).describe("Action to perform on the reviewers. Can be 'add' or 'remove'."),
+      reviewerIds: z.array(z.string()).describe(`List of reviewer ids to ${safeMode ? "add to" : "add to or remove from"} the pull request.`),
+      ...(safeMode ? {} : { action: z.enum(["add", "remove"]).describe("Action to perform on the reviewers. Can be 'add' or 'remove'.") }),
       project: z.string().optional().describe("Project ID or project name. Required when repositoryId is a repository name instead of a GUID."),
     },
-    async ({ repositoryId, pullRequestId, reviewerIds, action, project }) => {
+    async ({ repositoryId, pullRequestId, reviewerIds, action, project }: { repositoryId: string; pullRequestId: number; reviewerIds: string[]; action?: "add" | "remove"; project?: string }) => {
       try {
         const connection = await connectionProvider();
         const gitApi = await connection.getGitApi();
 
-        let updatedPullRequest;
-        if (action === "add") {
-          updatedPullRequest = await gitApi.createPullRequestReviewers(
-            reviewerIds.map((id) => ({ id: id })),
-            repositoryId,
-            pullRequestId,
-            project
-          );
-
-          const trimmedResponse = updatedPullRequest.map((item) => ({
-            displayName: item.displayName,
-            id: item.id,
-            uniqueName: item.uniqueName,
-            vote: item.vote,
-            hasDeclined: item.hasDeclined,
-            isFlagged: item.isFlagged,
-          }));
-
-          return {
-            content: [{ type: "text", text: JSON.stringify(trimmedResponse, null, 2) }],
-          };
-        } else {
+        if (!safeMode && action === "remove") {
           for (const reviewerId of reviewerIds) {
             await gitApi.deletePullRequestReviewer(repositoryId, pullRequestId, reviewerId, project);
           }
@@ -531,6 +547,26 @@ function configureRepoTools(server: McpServer, tokenProvider: () => Promise<stri
             content: [{ type: "text", text: `Reviewers with IDs ${reviewerIds.join(", ")} removed from pull request ${pullRequestId}.` }],
           };
         }
+
+        const updatedPullRequest = await gitApi.createPullRequestReviewers(
+          reviewerIds.map((id) => ({ id: id })),
+          repositoryId,
+          pullRequestId,
+          project
+        );
+
+        const trimmedResponse = updatedPullRequest.map((item) => ({
+          displayName: item.displayName,
+          id: item.id,
+          uniqueName: item.uniqueName,
+          vote: item.vote,
+          hasDeclined: item.hasDeclined,
+          isFlagged: item.isFlagged,
+        }));
+
+        return {
+          content: [{ type: "text", text: JSON.stringify(trimmedResponse, null, 2) }],
+        };
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 
