@@ -69,7 +69,7 @@ function getLinkTypeFromName(name: string) {
   }
 }
 
-function configureWorkItemTools(server: McpServer, tokenProvider: () => Promise<string>, connectionProvider: () => Promise<WebApi>, userAgentProvider: () => string) {
+function configureWorkItemTools(server: McpServer, tokenProvider: () => Promise<string>, connectionProvider: () => Promise<WebApi>, userAgentProvider: () => string, safeMode = false) {
   server.tool(
     WORKITEM_TOOLS.list_backlogs,
     "Receive a list of backlogs for a given project and team. If a project or team is not specified, you will be prompted to select one.",
@@ -1019,24 +1019,32 @@ function configureWorkItemTools(server: McpServer, tokenProvider: () => Promise<
     }
   );
 
+  const batchUpdateOpSchema = safeMode
+    ? z.enum(["Add", "Replace"]).default("Add").describe("The operation to perform on the field.")
+    : z.enum(["Add", "Replace", "Remove"]).default("Add").describe("The operation to perform on the field.");
+
+  const batchUpdatesSchema = z
+    .array(
+      z.object({
+        op: batchUpdateOpSchema,
+        id: z.coerce.number().min(1).describe("The ID of the work item to update."),
+        path: z.string().describe("The path of the field to update, e.g., '/fields/System.Title'."),
+        value: z.string().describe("The new value for the field. This is required for 'add' and 'replace' operations, and should be omitted for 'remove' operations."),
+        format: z.enum(["Html", "Markdown"]).optional().describe("The format of the field value. Only to be used for large text fields. e.g., 'Html', 'Markdown'. Optional, defaults to 'Markdown'."),
+      })
+    )
+    .pipe(safeMode ? z.array(z.any()).max(50) : z.array(z.any()))
+    .describe(
+      safeMode
+        ? "An array of updates to apply to work items (max 50 in safe mode). Each update should include the operation (op), work item ID (id), field path (path), and new value (value)."
+        : "An array of updates to apply to work items. Each update should include the operation (op), work item ID (id), field path (path), and new value (value)."
+    );
+
   server.tool(
     WORKITEM_TOOLS.update_work_items_batch,
     "Update work items in batch",
     {
-      updates: z
-        .array(
-          z.object({
-            op: z.enum(["Add", "Replace", "Remove"]).default("Add").describe("The operation to perform on the field."),
-            id: z.coerce.number().min(1).describe("The ID of the work item to update."),
-            path: z.string().describe("The path of the field to update, e.g., '/fields/System.Title'."),
-            value: z.string().describe("The new value for the field. This is required for 'add' and 'replace' operations, and should be omitted for 'remove' operations."),
-            format: z
-              .enum(["Html", "Markdown"])
-              .optional()
-              .describe("The format of the field value. Only to be used for large text fields. e.g., 'Html', 'Markdown'. Optional, defaults to 'Markdown'."),
-          })
-        )
-        .describe("An array of updates to apply to work items. Each update should include the operation (op), work item ID (id), field path (path), and new value (value)."),
+      updates: batchUpdatesSchema,
     },
     async ({ updates }) => {
       try {
@@ -1193,92 +1201,93 @@ function configureWorkItemTools(server: McpServer, tokenProvider: () => Promise<
     }
   );
 
-  server.tool(
-    WORKITEM_TOOLS.work_item_unlink,
-    "Remove one or many links from a single work item. If a project is not specified, you will be prompted to select one.",
-    {
-      project: z.string().optional().describe("The name or ID of the Azure DevOps project. Reuse from prior context if already known. If not provided, a project selection prompt will be shown."),
-      id: z.coerce.number().min(1).describe("The ID of the work item to remove the links from."),
-      type: z
-        .enum(["parent", "child", "duplicate", "duplicate of", "related", "successor", "predecessor", "tested by", "tests", "affects", "affected by", "artifact"])
-        .default("related")
-        .describe(
-          "Type of link to remove. Options include 'parent', 'child', 'duplicate', 'duplicate of', 'related', 'successor', 'predecessor', 'tested by', 'tests', 'affects', 'affected by', and 'artifact'. Defaults to 'related'."
-        ),
-      url: z.string().optional().describe("Optional URL to match for the link to remove. If not provided, all links of the specified type will be removed."),
-    },
-    async ({ project, id, type, url }) => {
-      try {
-        const connection = await connectionProvider();
+  if (!safeMode)
+    server.tool(
+      WORKITEM_TOOLS.work_item_unlink,
+      "Remove one or many links from a single work item. If a project is not specified, you will be prompted to select one.",
+      {
+        project: z.string().optional().describe("The name or ID of the Azure DevOps project. Reuse from prior context if already known. If not provided, a project selection prompt will be shown."),
+        id: z.coerce.number().min(1).describe("The ID of the work item to remove the links from."),
+        type: z
+          .enum(["parent", "child", "duplicate", "duplicate of", "related", "successor", "predecessor", "tested by", "tests", "affects", "affected by", "artifact"])
+          .default("related")
+          .describe(
+            "Type of link to remove. Options include 'parent', 'child', 'duplicate', 'duplicate of', 'related', 'successor', 'predecessor', 'tested by', 'tests', 'affects', 'affected by', and 'artifact'. Defaults to 'related'."
+          ),
+        url: z.string().optional().describe("Optional URL to match for the link to remove. If not provided, all links of the specified type will be removed."),
+      },
+      async ({ project, id, type, url }) => {
+        try {
+          const connection = await connectionProvider();
 
-        let resolvedProject = project;
-        if (!resolvedProject) {
-          const result = await elicitProject(server, connection, "Select the Azure DevOps project to unlink work items in.");
-          if ("response" in result) return result.response;
-          resolvedProject = result.resolved;
-        }
+          let resolvedProject = project;
+          if (!resolvedProject) {
+            const result = await elicitProject(server, connection, "Select the Azure DevOps project to unlink work items in.");
+            if ("response" in result) return result.response;
+            resolvedProject = result.resolved;
+          }
 
-        const workItemApi = await connection.getWorkItemTrackingApi();
-        const workItem = await workItemApi.getWorkItem(id, undefined, undefined, WorkItemExpand.Relations, resolvedProject);
-        const relations: WorkItemRelation[] = workItem.relations ?? [];
-        const linkType = getLinkTypeFromName(type);
+          const workItemApi = await connection.getWorkItemTrackingApi();
+          const workItem = await workItemApi.getWorkItem(id, undefined, undefined, WorkItemExpand.Relations, resolvedProject);
+          const relations: WorkItemRelation[] = workItem.relations ?? [];
+          const linkType = getLinkTypeFromName(type);
 
-        let relationIndexes: number[] = [];
+          let relationIndexes: number[] = [];
 
-        if (url && url.trim().length > 0) {
-          // If url is provided, find relations matching both rel type and url
-          relationIndexes = relations.map((relation, idx) => (relation.rel === linkType && relation.url === url ? idx : -1)).filter((idx) => idx !== -1);
-        } else {
-          // If url is not provided, find all relations matching rel type
-          relationIndexes = relations.map((relation, idx) => (relation.rel === linkType ? idx : -1)).filter((idx) => idx !== -1);
-        }
+          if (url && url.trim().length > 0) {
+            // If url is provided, find relations matching both rel type and url
+            relationIndexes = relations.map((relation, idx) => (relation.rel === linkType && relation.url === url ? idx : -1)).filter((idx) => idx !== -1);
+          } else {
+            // If url is not provided, find all relations matching rel type
+            relationIndexes = relations.map((relation, idx) => (relation.rel === linkType ? idx : -1)).filter((idx) => idx !== -1);
+          }
 
-        if (relationIndexes.length === 0) {
+          if (relationIndexes.length === 0) {
+            return {
+              content: [{ type: "text", text: `No matching relations found for link type '${type}'${url ? ` and URL '${url}'` : ""}.\n${JSON.stringify(relations, null, 2)}` }],
+              isError: true,
+            };
+          }
+
+          // Get the relations that will be removed for logging
+          const removedRelations = relationIndexes.map((idx) => relations[idx]);
+
+          // Sort indexes in descending order to avoid index shifting when removing
+          relationIndexes.sort((a, b) => b - a);
+
+          const apiUpdates = relationIndexes.map((idx) => ({
+            op: "remove",
+            path: `/relations/${idx}`,
+          }));
+
+          const updatedWorkItem = await workItemApi.updateWorkItem(null, apiUpdates, id, resolvedProject);
+
           return {
-            content: [{ type: "text", text: `No matching relations found for link type '${type}'${url ? ` and URL '${url}'` : ""}.\n${JSON.stringify(relations, null, 2)}` }],
+            content: [
+              {
+                type: "text",
+                text:
+                  `Removed ${removedRelations.length} link(s) of type '${type}':\n` +
+                  JSON.stringify(removedRelations, null, 2) +
+                  `\n\nUpdated work item result:\n` +
+                  JSON.stringify(updatedWorkItem, null, 2),
+              },
+            ],
+            isError: false,
+          };
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Error unlinking work item: ${error instanceof Error ? error.message : "Unknown error occurred"}`,
+              },
+            ],
             isError: true,
           };
         }
-
-        // Get the relations that will be removed for logging
-        const removedRelations = relationIndexes.map((idx) => relations[idx]);
-
-        // Sort indexes in descending order to avoid index shifting when removing
-        relationIndexes.sort((a, b) => b - a);
-
-        const apiUpdates = relationIndexes.map((idx) => ({
-          op: "remove",
-          path: `/relations/${idx}`,
-        }));
-
-        const updatedWorkItem = await workItemApi.updateWorkItem(null, apiUpdates, id, resolvedProject);
-
-        return {
-          content: [
-            {
-              type: "text",
-              text:
-                `Removed ${removedRelations.length} link(s) of type '${type}':\n` +
-                JSON.stringify(removedRelations, null, 2) +
-                `\n\nUpdated work item result:\n` +
-                JSON.stringify(updatedWorkItem, null, 2),
-            },
-          ],
-          isError: false,
-        };
-      } catch (error) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Error unlinking work item: ${error instanceof Error ? error.message : "Unknown error occurred"}`,
-            },
-          ],
-          isError: true,
-        };
       }
-    }
-  );
+    );
 
   server.tool(
     WORKITEM_TOOLS.add_artifact_link,
